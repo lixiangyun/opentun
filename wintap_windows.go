@@ -8,12 +8,8 @@ import (
 	"net"
 )
 
-const IO_BUFFER_NUM = 1024
-const MAX_PROCS = 1024
-
 const (
 	TAPWIN32_MAX_REG_SIZE = 256
-	TUNTAP_COMPONENT_ID = "tap0901"
 	ADAPTER_KEY = `SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}`
 	NETWORK_CONNECTIONS_KEY = `SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}`
 	USERMODEDEVICEDIR = `\\.\Global\`
@@ -48,10 +44,6 @@ type TunWin struct {
 	NetworkName      string
 }
 
-var (
-	componentId string
-)
-
 func ctl_code(device_type, function, method, access uint32) uint32 {
 	return (device_type << 16) | (access << 14) | (function << 2) | method
 }
@@ -64,7 +56,7 @@ func tap_ioctl(cmd uint32) uint32 {
 	return tap_control_code(cmd, METHOD_BUFFERED)
 }
 
-func matchKey(zones registry.Key, kName string, componentId string) (string, error) {
+func matchKey(zones registry.Key, kName string) (string, error) {
 	k, err := registry.OpenKey(zones, kName, registry.READ)
 	if err != nil {
 		return "", err
@@ -72,43 +64,51 @@ func matchKey(zones registry.Key, kName string, componentId string) (string, err
 	defer k.Close()
 
 	cId, _, err := k.GetStringValue("ComponentId")
-	if cId == componentId {
+	if cId == "tap0901" {
 		netCfgInstanceId, _, err := k.GetStringValue("NetCfgInstanceId")
 		if err != nil {
 			return "", err
 		}
 		return netCfgInstanceId, nil
-
 	}
-	return "", fmt.Errorf("ComponentId != componentId")
+	cId, _, err = k.GetStringValue("ProductName")
+	if cId == "TAP-Windows Adapter V9" {
+		netCfgInstanceId, _, err := k.GetStringValue("NetCfgInstanceId")
+		if err != nil {
+			return "", err
+		}
+		return netCfgInstanceId, nil
+	}
+
+	return "", fmt.Errorf("not tap windows interface")
 }
 
-func getTuntapComponentId() (string, error) {
-	if (componentId != "") {
-		return componentId, nil
-	}
-
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
-		ADAPTER_KEY,
+func getTuntapInstanceID() ([]string, error) {
+	k, err := registry.OpenKey(
+		registry.LOCAL_MACHINE, ADAPTER_KEY,
 		registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer k.Close()
 
 	names, err := k.ReadSubKeyNames(-1)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
+	instanceIDs := make([]string, 0)
 	for _, name := range names {
-		n, _ := matchKey(k, name, TUNTAP_COMPONENT_ID)
-		if n != "" {
-			componentId = n
-			return n, nil
+		nID, _ := matchKey(k, name)
+		if nID != "" {
+			instanceIDs = append(instanceIDs, nID)
 		}
 	}
-	return "", fmt.Errorf("Not Found")
+
+	if len(instanceIDs) == 0 {
+		return nil, fmt.Errorf("Not Found")
+	}
+	return instanceIDs, nil
 }
 
 // OpenTun function open the tap0901 device and set config
@@ -119,22 +119,30 @@ func getTuntapComponentId() (string, error) {
 // The tun will process those transmit between local ip
 // and remote network
 func openTun(addr, network, mask net.IP) (*TunWin, error) {
-	id, err := getTuntapComponentId()
+	nIDs, err := getTuntapInstanceID()
 	if err != nil {
 		return nil, err
 	}
 
-	tun := &TunWin{
-		ID:         id,
-		DevicePath: fmt.Sprintf(USERMODEDEVICEDIR+"%s"+TAP_WIN_SUFFIX, id),}
+	tun := new(TunWin)
+	for _, id := range nIDs {
+		tun.ID = id
+		tun.DevicePath = fmt.Sprintf(USERMODEDEVICEDIR+"%s"+TAP_WIN_SUFFIX, id)
 
-	name, _ := windows.UTF16PtrFromString(fmt.Sprintf(`\\.\Global\%s.tap`, id))
-	access := uint32(windows.GENERIC_READ | windows.GENERIC_WRITE)
-	mode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+		name, _ := windows.UTF16PtrFromString(fmt.Sprintf(`\\.\Global\%s.tap`, id))
+		access := uint32(windows.GENERIC_READ | windows.GENERIC_WRITE)
+		mode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
 
-	tun.FD, err = windows.CreateFile(name, access, mode, nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_SYSTEM | windows.FILE_FLAG_OVERLAPPED, 0)
+		tun.FD, err = windows.CreateFile(name, access, mode, nil,
+			windows.OPEN_EXISTING,
+			windows.FILE_ATTRIBUTE_SYSTEM | windows.FILE_FLAG_OVERLAPPED, 0)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+		break
+	}
+
 	if err != nil {
 		return nil, err
 	}
